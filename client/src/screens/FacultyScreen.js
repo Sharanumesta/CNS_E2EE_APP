@@ -17,7 +17,7 @@ const messageOptions = [
 const FacultySendMessage = () => {
   const [messageType, setMessageType] = useState("result");
   const [message, setMessage] = useState("");
-  const [students, setStudents] = useState([]);
+  const [students, setStudents] = useState([]); // [{ _id, publicKey }]
   const [loading, setLoading] = useState(false);
   const [token, setToken] = useState("");
 

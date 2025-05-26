@@ -19,28 +19,25 @@ import axios from "axios";
 import forge from "node-forge";
 import * as SecureStore from "expo-secure-store";
 import Constants from "expo-constants";
-import { decryptPrivateKey } from "../utils/crypto.js";
+import { decryptMessage, decryptPrivateKey } from "../utils/crypto";
 
 const { API_URL } = Constants.expoConfig.extra;
 
-const storePrivateKeySafely = async (key, value) => {
-  const maxChunkSize = 2000;
+const MAX_CHUNK_SIZE = 2000;
 
-  if (value.length <= maxChunkSize) {
+const storePrivateKeySafely = async (key, value) => {
+  if (value.length <= MAX_CHUNK_SIZE) {
     await SecureStore.setItemAsync(key, value);
     await SecureStore.deleteItemAsync(`${key}_chunks`).catch(() => {});
   } else {
     const chunks = [];
-    for (let i = 0; i < value.length; i += maxChunkSize) {
-      chunks.push(value.substring(i, i + maxChunkSize));
+    for (let i = 0; i < value.length; i += MAX_CHUNK_SIZE) {
+      chunks.push(value.substring(i, i + MAX_CHUNK_SIZE));
     }
-
     await SecureStore.setItemAsync(`${key}_chunks`, chunks.length.toString());
-
-    for (let i = 0; i < chunks.length; i++) {
-      await SecureStore.setItemAsync(`${key}_${i}`, chunks[i]);
-    }
-
+    await Promise.all(
+      chunks.map((chunk, i) => SecureStore.setItemAsync(`${key}_${i}`, chunk))
+    );
     await SecureStore.deleteItemAsync(key).catch(() => {});
   }
 };
@@ -48,29 +45,24 @@ const storePrivateKeySafely = async (key, value) => {
 const loadPrivateKeySafely = async (key) => {
   try {
     const singleValue = await SecureStore.getItemAsync(key);
-    if (singleValue) {
-      return singleValue;
-    }
+    if (singleValue) return singleValue;
 
     const chunksCountStr = await SecureStore.getItemAsync(`${key}_chunks`);
-    if (!chunksCountStr) {
-      return null;
-    }
+    if (!chunksCountStr) return null;
 
     const chunksCount = parseInt(chunksCountStr);
-    const chunks = [];
+    const chunks = await Promise.all(
+      Array.from({ length: chunksCount }, (_, i) =>
+        SecureStore.getItemAsync(`${key}_${i}`)
+      )
+    );
 
-    for (let i = 0; i < chunksCount; i++) {
-      const chunk = await SecureStore.getItemAsync(`${key}_${i}`);
-      if (!chunk) {
-        throw new Error(`Missing chunk ${i} for key ${key}`);
-      }
-      chunks.push(chunk);
-    }
+    if (chunks.includes(null))
+      throw new Error("One or more key chunks are missing");
 
     return chunks.join("");
   } catch (error) {
-    console.error(`Error loading private key safely:`, error);
+    console.error("[loadPrivateKeySafely] Error:", error);
     return null;
   }
 };
@@ -79,7 +71,7 @@ const StudentScreen = () => {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [password, setPassword] = useState("");
-  const [privateKeyPem, setPrivateKeyPem] = useState(null); // <-- THIS WAS MISSING
+  const [privateKeyPem, setPrivateKeyPem] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [passwordDialogVisible, setPasswordDialogVisible] = useState(false);
   const [token, setToken] = useState(null);
@@ -90,6 +82,7 @@ const StudentScreen = () => {
       try {
         const storedToken = await SecureStore.getItemAsync("token");
         const storedStudentId = await SecureStore.getItemAsync("studentId");
+
         if (!storedToken || !storedStudentId) {
           Alert.alert(
             "Error",
@@ -101,16 +94,16 @@ const StudentScreen = () => {
         setToken(storedToken);
         setStudentId(storedStudentId);
 
-        const storedDecryptedKey = await loadPrivateKeySafely("privateKeyPem");
-        if (storedDecryptedKey) {
-          setPrivateKeyPem(storedDecryptedKey);
-          await fetchMessagesAndDecrypt(storedDecryptedKey, storedToken);
+        const storedKey = await loadPrivateKeySafely("privateKeyPem");
+        if (storedKey) {
+          setPrivateKeyPem(storedKey);
+          await fetchMessagesAndDecrypt(storedKey, storedToken);
         } else {
           setPasswordDialogVisible(true);
         }
       } catch (err) {
-        console.error("[Init] Error during initialization:", err);
-        Alert.alert("Error", "Failed to initialize student screen");
+        console.error("[Init] Error:", err);
+        Alert.alert("Error", "Failed to initialize student screen.");
       }
     };
 
@@ -118,17 +111,17 @@ const StudentScreen = () => {
   }, []);
 
   const onRefresh = async () => {
+    if (!privateKeyPem || !token) {
+      Alert.alert("Error", "You must be logged in to refresh messages.");
+      return;
+    }
+
     setRefreshing(true);
     try {
-      if (!privateKeyPem || !token) {
-        Alert.alert("Error", "You must be logged in to refresh messages.");
-        setRefreshing(false);
-        return;
-      }
       await fetchMessagesAndDecrypt(privateKeyPem, token);
     } catch (error) {
-      console.error("[Refresh] Error refreshing messages:", error);
-      Alert.alert("Error", "Failed to refresh messages");
+      console.error("[onRefresh] Error:", error);
+      Alert.alert("Error", "Failed to refresh messages.");
     } finally {
       setRefreshing(false);
     }
@@ -136,103 +129,35 @@ const StudentScreen = () => {
 
   const loadEncryptedPrivateKey = async () => {
     try {
-      const encryptedPrivateKeyPem = await SecureStore.getItemAsync(
+      const encryptedKey = await SecureStore.getItemAsync(
         "encryptedPrivateKey"
       );
-      if (!encryptedPrivateKeyPem) {
-        throw new Error("Private key not found in storage");
-      }
-      return encryptedPrivateKeyPem;
+      if (!encryptedKey) throw new Error("Encrypted private key not found");
+      return encryptedKey;
     } catch (err) {
-      console.error(
-        "[LoadEncryptedKey] Error loading encrypted private key:",
-        err
-      );
-      Alert.alert("Error", "Unable to load encrypted private key");
+      console.error("[loadEncryptedPrivateKey] Error:", err);
+      Alert.alert("Error", "Failed to load encrypted private key.");
       return null;
     }
   };
 
-  const decryptMessage = (message, privateKeyPem, currentStudentId) => {
-    try {
-      if (!message.encryptedKey || !message.iv || !message.encryptedContent) {
-        throw new Error("Missing encryption fields");
-      }
-
-      const privateKey = forge.pki.privateKeyFromPem(privateKeyPem);
-
-      let encryptedAesKey;
-      if (typeof message.encryptedKey === "string") {
-        encryptedAesKey = message.encryptedKey;
-      } else if (typeof message.encryptedKey === "object") {
-        encryptedAesKey = message.encryptedKey[currentStudentId];
-        if (!encryptedAesKey) {
-          throw new Error(
-            `No encrypted key found for student ID: ${currentStudentId}`
-          );
-        }
-      } else {
-        throw new Error("Invalid encryptedKey format");
-      }
-
-      const encryptedKeyBytes = forge.util.decode64(encryptedAesKey);
-      const aesKeyString = privateKey.decrypt(encryptedKeyBytes, "RSA-OAEP");
-
-      const ivString = forge.util.decode64(message.iv);
-      const encryptedContentBytes = forge.util.decode64(
-        message.encryptedContent
-      );
-
-      const decipher = forge.cipher.createDecipher("AES-CBC", aesKeyString);
-      decipher.start({ iv: ivString });
-      decipher.update(forge.util.createBuffer(encryptedContentBytes));
-      const success = decipher.finish();
-
-      if (!success) {
-        throw new Error("AES decryption failed");
-      }
-
-      return decipher.output.toString();
-    } catch (err) {
-      console.error("[DecryptMessage] Decryption error for message:", err);
-      return "[Decryption failed: " + err.message + "]";
-    }
-  };
-
-  const fetchMessagesAndDecrypt = async (
-    decryptedPrivateKeyPem,
-    accessToken
-  ) => {
+  const fetchMessagesAndDecrypt = async (keyPem, authToken) => {
     setLoading(true);
     try {
-      const tokenToUse = accessToken || token;
-
-      const response = await axios.get(`${API_URL}/student/messages`, {
-        headers: { Authorization: `Bearer ${tokenToUse}` },
+      const res = await axios.get(`${API_URL}/student/messages`, {
+        headers: { Authorization: `Bearer ${authToken}` },
       });
 
-      const decryptedMessages = response.data.messages.map((msg) => ({
+      const decryptedMessages = res.data.messages.map((msg) => ({
         ...msg,
-        decryptedContent: decryptMessage(
-          msg,
-          decryptedPrivateKeyPem,
-          studentId
-        ),
+        decryptedContent: decryptMessage(msg, keyPem, studentId),
       }));
 
       setMessages(decryptedMessages);
-      setPrivateKeyPem(decryptedPrivateKeyPem);
       setPasswordDialogVisible(false);
     } catch (error) {
-      console.error(
-        "[FetchMessages] Error fetching or decrypting messages:",
-        error
-      );
-      Alert.alert(
-        "Error",
-        "Failed to load or decrypt messages: " +
-          (error.response?.data?.message || error.message)
-      );
+      console.error("[fetchMessagesAndDecrypt] Error:", error);
+      Alert.alert("Error", "Failed to fetch or decrypt messages.");
     } finally {
       setLoading(false);
     }
@@ -240,47 +165,36 @@ const StudentScreen = () => {
 
   const onPasswordSubmit = async () => {
     if (!password) {
-      Alert.alert("Error", "Please enter your password");
+      Alert.alert("Error", "Please enter your password.");
       return;
     }
 
     setLoading(true);
     try {
-      const encryptedPrivateKeyPem = await loadEncryptedPrivateKey();
-      if (!encryptedPrivateKeyPem) {
-        setLoading(false);
-        return;
-      }
-
+      const encryptedPem = await loadEncryptedPrivateKey();
       const salt = await SecureStore.getItemAsync("salt");
       const iv = await SecureStore.getItemAsync("iv");
 
-      if (!salt || !iv) {
-        throw new Error("Missing salt or iv for decryption");
+      if (!encryptedPem || !salt || !iv) {
+        throw new Error("Missing encrypted key, salt, or IV.");
       }
 
-      const decryptedPrivateKeyPem = decryptPrivateKey(
-        encryptedPrivateKeyPem,
-        password,
-        salt,
-        iv
-      );
+      const decryptedKey = decryptPrivateKey(encryptedPem, password, salt, iv);
+      forge.pki.privateKeyFromPem(decryptedKey); // validate
 
-      forge.pki.privateKeyFromPem(decryptedPrivateKeyPem); // validate
-
-      await storePrivateKeySafely("privateKeyPem", decryptedPrivateKeyPem);
-
-      await fetchMessagesAndDecrypt(decryptedPrivateKeyPem);
+      await storePrivateKeySafely("privateKeyPem", decryptedKey);
+      await fetchMessagesAndDecrypt(decryptedKey, token);
+      setPrivateKeyPem(decryptedKey);
     } catch (err) {
-      console.error("[PasswordSubmit] Error:", err);
-      Alert.alert("Error", err.message || "Failed to decrypt private key");
+      console.error("[onPasswordSubmit] Error:", err);
+      Alert.alert("Error", err.message || "Failed to decrypt key.");
     } finally {
       setLoading(false);
     }
   };
 
   const renderMessage = ({ item }) => (
-    <Card style={{ margin: 8 }}>
+    <Card style={{ marginVertical: 8, marginHorizontal: 12 }}>
       <Card.Title
         title={`Type: ${item.messageType}`}
         subtitle={`Sent: ${new Date(item.createdAt).toLocaleString()}`}
@@ -304,7 +218,7 @@ const StudentScreen = () => {
   if (loading) {
     return (
       <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
-        <ActivityIndicator animating={true} size="large" />
+        <ActivityIndicator animating size="large" />
         <Text style={{ marginTop: 16 }}>
           {passwordDialogVisible ? "Decrypting messages..." : "Loading..."}
         </Text>
@@ -323,15 +237,8 @@ const StudentScreen = () => {
         renderItem={renderMessage}
         contentContainerStyle={{ padding: 10 }}
         ListEmptyComponent={
-          <View
-            style={{
-              flex: 1,
-              justifyContent: "center",
-              alignItems: "center",
-              paddingTop: 50,
-            }}
-          >
-            <Text style={{ textAlign: "center", fontSize: 16, color: "gray" }}>
+          <View style={{ marginTop: 50, alignItems: "center" }}>
+            <Text style={{ color: "gray", fontSize: 16 }}>
               No messages found.
             </Text>
           </View>
@@ -339,48 +246,33 @@ const StudentScreen = () => {
         refreshing={refreshing}
         onRefresh={onRefresh}
       />
-      
-      <Text
-        style={{
-          marginTop: 16,
-          marginBottom: 16,
-          fontSize: 12,
-          color: "gray",
-          textAlign: "center",
-        }}
-      >
-        Messages are encrypted with AES-256 + RSA-OAEP for end-to-end security
-      </Text>
 
       <Portal>
         <Dialog visible={passwordDialogVisible} dismissable={false}>
-          <Dialog.Title>Enter Password to Decrypt Messages</Dialog.Title>
+          <Dialog.Title>Decrypt Messages</Dialog.Title>
           <Dialog.Content>
-            <Text style={{ marginBottom: 16, color: "gray" }}>
-              Your password is required to decrypt your private key and view
-              messages.
+            <Text style={{ marginBottom: 10, color: "gray" }}>
+              Enter your password to unlock your private key.
             </Text>
             <RNTextInput
-              placeholder="Enter your password"
+              placeholder="Password"
               secureTextEntry
-              onChangeText={setPassword}
               value={password}
+              onChangeText={setPassword}
               style={{
                 backgroundColor: "white",
-                paddingHorizontal: 10,
-                paddingVertical: 8,
+                padding: 10,
                 borderRadius: 4,
                 borderWidth: 1,
-                borderColor: "#ddd",
-                marginTop: 10,
+                borderColor: "#ccc",
               }}
-              autoFocus
               onSubmitEditing={onPasswordSubmit}
+              autoFocus
             />
           </Dialog.Content>
           <Dialog.Actions>
             <Button onPress={onPasswordSubmit} mode="contained">
-              Decrypt Messages
+              Decrypt
             </Button>
           </Dialog.Actions>
         </Dialog>
