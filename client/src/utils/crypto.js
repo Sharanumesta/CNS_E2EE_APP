@@ -1,6 +1,10 @@
 import forge from "node-forge";
 
-// === RSA Key Pair Generation ===
+/**
+ * === RSA Key Pair Generation ===
+ * Generates a 2048-bit RSA key pair (public/private).
+ * Validates the key by encrypting and decrypting a test message.
+ */
 export const generateKeyPair = async () => {
   return new Promise((resolve, reject) => {
     forge.pki.rsa.generateKeyPair(
@@ -11,10 +15,11 @@ export const generateKeyPair = async () => {
           reject(err);
           return;
         }
+
         const publicKeyPem = forge.pki.publicKeyToPem(keypair.publicKey);
         const privateKeyPem = forge.pki.privateKeyToPem(keypair.privateKey);
 
-        // Validate the key pair works
+        // Validate key pair by performing encrypt/decrypt
         const testMsg = "test message";
         const encrypted = keypair.publicKey.encrypt(testMsg, "RSA-OAEP", {
           md: forge.md.sha256.create(),
@@ -39,21 +44,18 @@ export const generateKeyPair = async () => {
   });
 };
 
-// === Encrypt Private Key with AES-CBC + PBKDF2 ===
+/**
+ * === Encrypt Private Key (AES-CBC + PBKDF2) ===
+ * Secures the private key using a password-based AES encryption.
+ * PBKDF2 derives a strong key from the password.
+ */
 export const encryptPrivateKey = async (privateKeyPem, password) => {
   const salt = forge.random.getBytesSync(16);
   const iv = forge.random.getBytesSync(16);
 
-  // Key derivation with PBKDF2
-  const key = forge.pkcs5.pbkdf2(
-    password,
-    salt,
-    10000, // iterations
-    32, // key size (32 bytes = 256 bits)
-    forge.md.sha256.create()
-  );
+  // Derive AES key from password
+  const key = forge.pkcs5.pbkdf2(password, salt, 10000, 32, forge.md.sha256.create());
 
-  // AES-CBC encryption
   const cipher = forge.cipher.createCipher("AES-CBC", key);
   cipher.start({ iv });
   cipher.update(forge.util.createBuffer(privateKeyPem, "utf8"));
@@ -66,24 +68,19 @@ export const encryptPrivateKey = async (privateKeyPem, password) => {
   };
 };
 
-// === Decrypt Private Key with AES-CBC + PBKDF2 ===
+/**
+ * === Decrypt Private Key (AES-CBC + PBKDF2) ===
+ * Reverses the encryption above using the same password and parameters.
+ * Throws error if decryption fails or password is incorrect.
+ */
 export const decryptPrivateKey = (encryptedPem, password, saltB64, ivB64) => {
   try {
-    // Decode base64 parameters
     const salt = forge.util.decode64(saltB64);
     const iv = forge.util.decode64(ivB64);
     const encryptedBytes = forge.util.decode64(encryptedPem);
 
-    // Recreate the key
-    const key = forge.pkcs5.pbkdf2(
-      password,
-      salt,
-      10000,
-      32,
-      forge.md.sha256.create()
-    );
+    const key = forge.pkcs5.pbkdf2(password, salt, 10000, 32, forge.md.sha256.create());
 
-    // Decrypt
     const decipher = forge.cipher.createDecipher("AES-CBC", key);
     decipher.start({ iv });
     decipher.update(forge.util.createBuffer(encryptedBytes));
@@ -95,7 +92,7 @@ export const decryptPrivateKey = (encryptedPem, password, saltB64, ivB64) => {
 
     const decrypted = decipher.output.toString();
 
-    // Validate the decrypted private key
+    // Parse PEM format to ensure it's valid
     forge.pki.privateKeyFromPem(decrypted);
     return decrypted;
   } catch (err) {
@@ -109,25 +106,30 @@ export const decryptPrivateKey = (encryptedPem, password, saltB64, ivB64) => {
   }
 };
 
-// === Encrypt Message for Students (Hybrid RSA-AES) ===
+/**
+ * === Encrypt Message for Students (Hybrid Encryption) ===
+ * Uses AES-CBC to encrypt the message content.
+ * Then encrypts the AES key using each student's RSA public key.
+ * Result: one encrypted message + encrypted keys for each student.
+ */
 export const encryptMessageForStudents = async (plainText, students) => {
   try {
     if (!plainText || typeof plainText !== "string") {
       throw new Error("Message must be a non-empty string");
     }
 
-    // Generate random AES key and IV
+    // Generate AES key and IV
     const aesKey = forge.random.getBytesSync(32);
     const iv = forge.random.getBytesSync(16);
 
-    // Encrypt message with AES
+    // Encrypt the message using AES
     const cipher = forge.cipher.createCipher("AES-CBC", aesKey);
     cipher.start({ iv });
     cipher.update(forge.util.createBuffer(plainText, "utf8"));
     cipher.finish();
     const encryptedContent = forge.util.encode64(cipher.output.getBytes());
 
-    // Encrypt AES key for each student
+    // Encrypt the AES key with each student's RSA public key
     const encryptedKeys = {};
     for (const student of students) {
       try {
@@ -156,6 +158,11 @@ export const encryptMessageForStudents = async (plainText, students) => {
   }
 };
 
+/**
+ * === Decrypt Message ===
+ * Student uses their RSA private key to decrypt the AES key.
+ * Then decrypts the AES-encrypted content using that key and IV.
+ */
 export const decryptMessage = (message, privateKeyPem, currentStudentId) => {
   try {
     if (!message.encryptedKey || !message.iv || !message.encryptedContent) {
@@ -164,6 +171,7 @@ export const decryptMessage = (message, privateKeyPem, currentStudentId) => {
 
     const privateKey = forge.pki.privateKeyFromPem(privateKeyPem);
 
+    // Determine the AES key specific to this student
     let encryptedAesKey;
     if (typeof message.encryptedKey === "string") {
       encryptedAesKey = message.encryptedKey;
@@ -178,13 +186,13 @@ export const decryptMessage = (message, privateKeyPem, currentStudentId) => {
 
     const encryptedKeyBytes = forge.util.decode64(encryptedAesKey);
 
+    // Decrypt AES key using RSA private key
     const aesKey = privateKey.decrypt(encryptedKeyBytes, "RSA-OAEP", {
       md: forge.md.sha256.create(),
-      mgf1: {
-        md: forge.md.sha256.create(),
-      },
+      mgf1: { md: forge.md.sha256.create() },
     });
 
+    // Use decrypted AES key to decrypt message
     const ivBytes = forge.util.decode64(message.iv);
     const encryptedContentBytes = forge.util.decode64(message.encryptedContent);
 
@@ -203,81 +211,3 @@ export const decryptMessage = (message, privateKeyPem, currentStudentId) => {
     return "[Decryption failed: " + err.message + "]";
   }
 };
-
-// import * as SecureStore from 'expo-secure-store';
-// import forge from 'node-forge';
-
-// const AES_KEY_SIZE = 32; // 256-bit key
-// const IV_SIZE = 16;      // 128-bit IV
-
-// // === Generate and store AES key securely per student ===
-// export const generateAndStoreSymmetricKey = async (studentId) => {
-//   try {
-//     const key = forge.random.getBytesSync(AES_KEY_SIZE);
-//     const encodedKey = forge.util.encode64(key);
-//     await SecureStore.setItemAsync(`aesKey-${studentId}`, encodedKey);
-//     return encodedKey;
-//   } catch (error) {
-//     console.error('[generateAndStoreSymmetricKey] Error:', error);
-//     throw new Error('Failed to generate or store AES key');
-//   }
-// };
-
-// // === Retrieve AES key from SecureStore ===
-// export const getSymmetricKey = async (studentId) => {
-//   try {
-//     const stored = await SecureStore.getItemAsync(`aesKey-${studentId}`);
-//     if (!stored) throw new Error('Missing AES key for student');
-//     return stored;
-//   } catch (error) {
-//     console.error('[getSymmetricKey] Error:', error);
-//     throw error;
-//   }
-// };
-
-// // === Encrypt plain text using AES-CBC ===
-// export const encryptMessage = (plainText, aesKeyBase64) => {
-//   if (typeof plainText !== "string") {
-//     throw new Error("plainText must be a string");
-//   }
-//   if (typeof aesKeyBase64 !== "string") {
-//     throw new Error("aesKeyBase64 must be a string");
-//   }
-
-//   const aesKey = forge.util.decode64(aesKeyBase64);
-//   const iv = forge.random.getBytesSync(IV_SIZE);
-
-//   const cipher = forge.cipher.createCipher("AES-CBC", aesKey);
-//   cipher.start({ iv });
-//   cipher.update(forge.util.createBuffer(plainText, "utf8"));
-//   cipher.finish();
-
-//   return {
-//     encryptedContent: forge.util.encode64(cipher.output.getBytes()),
-//     iv: forge.util.encode64(iv),
-//   };
-// };
-
-
-
-
-// // === Decrypt encrypted content using AES-CBC ===
-// export const decryptMessage = async (message, studentId) => {
-//   try {
-//     const aesKeyBase64 = await getSymmetricKey(studentId);
-//     const aesKey = forge.util.decode64(aesKeyBase64);
-//     const ivBytes = forge.util.decode64(message.iv);
-//     const encryptedBytes = forge.util.decode64(message.encryptedContent);
-
-//     const decipher = forge.cipher.createDecipher('AES-CBC', aesKey);
-//     decipher.start({ iv: ivBytes });
-//     decipher.update(forge.util.createBuffer(encryptedBytes));
-//     const success = decipher.finish();
-
-//     if (!success) throw new Error('AES decryption failed');
-//     return decipher.output.toString();
-//   } catch (error) {
-//     console.error('[decryptMessage] Error:', error);
-//     return `[Decryption failed: ${error.message}]`;
-//   }
-// };

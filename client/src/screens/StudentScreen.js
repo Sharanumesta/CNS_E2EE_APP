@@ -277,6 +277,16 @@ const StudentScreen = () => {
           </Dialog.Actions>
         </Dialog>
       </Portal>
+      <Text
+        style={{
+          marginTop: 16,
+          fontSize: 16,
+          color: "gray",
+          textAlign: "center",
+        }}
+      >
+        Messages are encrypted with AES-256 + RSA-OAEP for end-to-end security
+      </Text>
     </KeyboardAvoidingView>
   );
 };
